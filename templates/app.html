@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SecureVote — Digital voting</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/css/app.css" />
+</head>
+<body>
+  <div class="bg-grid"></div>
+  <div class="glow glow-a"></div>
+  <div class="glow glow-b"></div>
+
+  <header class="topbar">
+    <a href="/" class="brand">
+      <span class="brand-mark">◈</span>
+      <span>{{ app_name }}</span>
+    </a>
+    <nav class="top-actions" id="nav-auth"></nav>
+  </header>
+
+  <main class="shell">
+    <!-- Login -->
+    <section id="view-login" class="view card-elevated">
+      <h1>Welcome back</h1>
+      <p class="lede">Sign in as a voter or election administrator.</p>
+      <div class="tabs" role="tablist">
+        <button type="button" class="tab active" data-tab="voter">Voter</button>
+        <button type="button" class="tab" data-tab="admin">Admin</button>
+      </div>
+      <form id="form-voter-login" class="form-panel active">
+        <label>Voter ID <input name="voter_id" required autocomplete="username" /></label>
+        <label>Password <input name="password" type="password" required autocomplete="current-password" /></label>
+        <button type="submit" class="btn primary">Sign in</button>
+      </form>
+      <form id="form-admin-login" class="form-panel">
+        <div id="admin-first-run-banner" class="banner-warn hidden">
+          <p><strong>No administrator account found.</strong> Create one below, or set <code>ADMIN_USERNAME</code> and <code>ADMIN_PASSWORD</code> in <code>.env</code> and restart the server.</p>
+          <button type="button" class="btn primary sm" id="btn-go-admin-setup">Create administrator</button>
+        </div>
+        <label>Admin username <input name="username" required autocomplete="username" placeholder="e.g. admin" /></label>
+        <label>Password <input name="password" type="password" required autocomplete="current-password" /></label>
+        <p class="muted fineprint" id="admin-login-hint"></p>
+        <button type="submit" class="btn primary">Admin sign in</button>
+      </form>
+      <p class="muted fineprint">New voter? <button type="button" class="linkish" id="link-register">Create an account</button></p>
+    </section>
+
+    <section id="view-admin-setup" class="view card-elevated hidden">
+      <h1>Create administrator</h1>
+      <p class="lede">This only appears when no admin exists. Choose credentials you will use to manage elections.</p>
+      <form id="form-admin-first">
+        <label>Username <input name="username" required minlength="3" maxlength="64" pattern="[a-zA-Z0-9_-]+" title="Letters, numbers, underscore, hyphen" autocomplete="username" /></label>
+        <label>Password <input name="password" type="password" required minlength="8" autocomplete="new-password" /></label>
+        <button type="submit" class="btn primary">Create administrator</button>
+      </form>
+      <button type="button" class="btn ghost" id="link-admin-setup-back">Back to sign in</button>
+    </section>
+
+    <!-- Register -->
+    <section id="view-register" class="view card-elevated hidden">
+      <h1>Create voter account</h1>
+      <p class="lede">Your signing key stays in this browser only.</p>
+      <form id="form-register">
+        <label>Voter ID <input name="voter_id" required minlength="1" /></label>
+        <label>Password <input name="password" type="password" required minlength="8" /></label>
+        <button type="submit" class="btn primary">Register</button>
+      </form>
+      <button type="button" class="btn ghost" id="link-back-login">Back to sign in</button>
+    </section>
+
+    <!-- Voter dashboard -->
+    <section id="view-voter" class="view hidden">
+      <div class="dash-head">
+        <h1>Voter dashboard</h1>
+        <p class="lede" id="voter-welcome"></p>
+      </div>
+      <div id="voter-key-banner" class="card key-banner-voter hidden">
+        <p class="muted" style="margin:0 0 0.5rem">This browser does not have your voting signing key (for example after clearing site data, or if you opened the site as <code>localhost</code> before and now use <code>127.0.0.1</code> — those count as different storage). Enter your account password to generate a new key; <strong>past ballots stay valid</strong> on the server. You can still vote in other elections you are approved for.</p>
+        <form id="form-restore-key" class="row-inline">
+          <label class="grow" style="margin:0"><span class="lbl">Password</span><input type="password" name="password" required autocomplete="current-password" placeholder="Account password" /></label>
+          <button type="submit" class="btn primary sm">Restore key</button>
+        </form>
+      </div>
+      <div class="subtabs">
+        <button type="button" class="subtab active" data-vtab="discover">Elections</button>
+        <button type="button" class="subtab" data-vtab="ballots">My ballots</button>
+        <button type="button" class="subtab" data-vtab="results">Results</button>
+      </div>
+      <div id="v-panel-discover" class="v-panel"></div>
+      <div id="v-panel-ballots" class="v-panel hidden"></div>
+      <div id="v-panel-results" class="v-panel hidden"></div>
+    </section>
+
+    <!-- Admin dashboard -->
+    <section id="view-admin" class="view admin-app hidden">
+      <div class="dash-head admin-dash-head">
+        <div>
+          <h1>Election administration</h1>
+          <p class="lede" id="admin-welcome-line">Manage voter access, elections, and published results.</p>
+        </div>
+      </div>
+      <div id="admin-stats" class="admin-stats" aria-live="polite"></div>
+      <div class="subtabs admin-subtabs">
+        <button type="button" class="subtab active" data-atab="overview">Overview</button>
+        <button type="button" class="subtab" data-atab="approvals">Approvals <span id="badge-approvals" class="nav-badge hidden">0</span></button>
+        <button type="button" class="subtab" data-atab="create">New election</button>
+        <button type="button" class="subtab" data-atab="manage">Elections &amp; results</button>
+      </div>
+      <div id="a-panel-overview" class="a-panel">
+        <div class="card">
+          <h2>Quick actions</h2>
+          <p class="muted">Use the tabs above: approve voter requests, create an election with candidate photos, then close it and publish results so voters see counts.</p>
+          <div class="quick-actions">
+            <button type="button" class="btn ghost sm" id="qa-approvals">Open approvals</button>
+            <button type="button" class="btn ghost sm" id="qa-create">New election</button>
+            <button type="button" class="btn ghost sm" id="qa-manage">Manage &amp; publish</button>
+          </div>
+        </div>
+      </div>
+      <div id="a-panel-create" class="a-panel hidden">
+        <div class="card">
+          <h2>New election</h2>
+          <form id="form-create-election">
+            <label>Title <input name="title" required placeholder="e.g. Class representative 2026" /></label>
+            <label>Scope
+              <select name="category" required>
+                <option value="class">Class</option>
+                <option value="department">Department</option>
+                <option value="campus">Campus</option>
+              </select>
+            </label>
+            <div class="row-2">
+              <label>Opens (ISO) <input name="starts_at" type="datetime-local" required /></label>
+              <label>Closes (ISO) <input name="ends_at" type="datetime-local" required /></label>
+            </div>
+            <fieldset class="contestants-field">
+              <legend>Contestants <span class="muted">(photo + name)</span></legend>
+              <div id="contestant-rows"></div>
+              <button type="button" class="btn ghost sm" id="btn-add-contestant">+ Add contestant</button>
+            </fieldset>
+            <button type="submit" class="btn primary">Create election</button>
+          </form>
+        </div>
+      </div>
+      <div id="a-panel-approvals" class="a-panel hidden"></div>
+      <div id="a-panel-manage" class="a-panel hidden"></div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast hidden" role="status"></div>
+
+  <template id="tpl-contestant-row">
+    <div class="contestant-row">
+      <label class="grow"><span class="lbl">Name</span><input type="text" class="c-name" required placeholder="Candidate name" /></label>
+      <label class="file-wrap"><span class="lbl">Photo</span><input type="file" class="c-photo" accept="image/png,image/jpeg,image/webp" required /></label>
+      <button type="button" class="btn icon rm-row" title="Remove">×</button>
+    </div>
+  </template>
+
+  <script src="https://cdn.jsdelivr.net/npm/node-forge@1.3.1/dist/forge.min.js"></script>
+  <script defer src="/static/js/app.js"></script>
+</body>
+</html>
