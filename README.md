@@ -2,7 +2,7 @@
 
 Course-scale voting platform with a **web UI** at `/`, a JSON API under `/api`, and cryptography aligned with `docs/` (proposal, CDDR, interface spec, key lifecycle).
 
-## Why `http://127.0.0.1:8000/` showed `{"detail":"Not Found"}` before
+
 
 The root path `/` must serve the app. This project now serves **`GET /`** as the SecureVote UI. JSON APIs live under **`/api/...`** (for example `/api/login`). Hitting a path that does not exist still returns JSON `Not Found` from FastAPI.
 
