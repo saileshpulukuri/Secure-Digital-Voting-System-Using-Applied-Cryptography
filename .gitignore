@@ -32,3 +32,6 @@ htmlcov/
 build/
 dist/
 *.egg-info/
+
+# Runtime data (database, keys — never commit)
+data/
