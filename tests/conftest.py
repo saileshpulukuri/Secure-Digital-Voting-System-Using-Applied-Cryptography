@@ -15,6 +15,23 @@ def client(tmp_path, monkeypatch) -> Generator[TestClient, None, None]:
     monkeypatch.setenv("JWT_SECRET", "test-secret-key-for-jwt-tests-only")
     monkeypatch.setenv("ADMIN_PASSWORD", "test-admin-password")
     monkeypatch.setenv("ADMIN_USERNAME", "admin")
+    monkeypatch.setenv(
+        "STUDENT_EMAIL_ALLOWLIST",
+        ",".join(
+            [
+                "v1@umsystem.edu",
+                "dup@umsystem.edu",
+                "twice@umsystem.edu",
+                "sig@umsystem.edu",
+                "t1@umsystem.edu",
+                "rekey1@umsystem.edu",
+                "rekey2@umsystem.edu",
+                "rekey3@umsystem.edu",
+                "deleting@umsystem.edu",
+            ]
+        ),
+    )
+    monkeypatch.setenv("EXPOSE_OTP_IN_RESPONSE", "true")
 
     import src.api_routes as api_routes
     import src.auth_tokens as auth_tokens

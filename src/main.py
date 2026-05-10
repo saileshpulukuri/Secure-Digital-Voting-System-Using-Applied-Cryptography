@@ -31,7 +31,13 @@ async def lifespan(app: FastAPI):
         settings.election_starts_at,
         settings.election_ends_at,
     )
-    logger.info("Application started; database at %s", settings.db_file())
+    roster = sorted(settings.allowed_student_emails())
+    logger.info(
+        "Application started; database at %s; authorized student roster (%s): %s",
+        settings.db_file(),
+        len(roster),
+        ", ".join(roster) if roster else "(empty — no students can register)",
+    )
     yield
 
 

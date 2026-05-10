@@ -75,6 +75,15 @@ CREATE TABLE IF NOT EXISTS election_votes (
   UNIQUE(election_id, voter_id)
 );
 
+CREATE TABLE IF NOT EXISTS voter_login_otps (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  voter_id TEXT NOT NULL REFERENCES voters(voter_id) ON DELETE CASCADE,
+  otp_hash TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  consumed INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS audit_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   event_type TEXT NOT NULL,
