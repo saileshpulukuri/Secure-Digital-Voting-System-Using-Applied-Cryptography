@@ -11,6 +11,11 @@ const LS = {
 const $ = (sel, el = document) => el.querySelector(sel);
 const $$ = (sel, el = document) => [...el.querySelectorAll(sel)];
 
+/** Server returns otp_required: true (JSON boolean) after password check until the 6-digit code is submitted. */
+function responseRequestedOtp(d) {
+  return Boolean(d && d.otp_required === true);
+}
+
 function toast(msg, err = false) {
   const t = $("#toast");
   t.textContent = msg;
@@ -55,7 +60,34 @@ async function api(path, opts = {}) {
   }
   if (!r.ok) {
     const msg = data.detail || (typeof data === "string" ? data : JSON.stringify(data));
-    throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+    const msgStr = typeof msg === "string" ? msg : JSON.stringify(msg);
+    const voterAuthSent =
+      voter &&
+      (opts.auth === "voter" || opts.role === "voter" || (opts.auth !== "none" && opts.auth !== "admin"));
+    const clearVoterClientState = () => {
+      localStorage.removeItem(LS.voterTok);
+      localStorage.removeItem(LS.voterId);
+      localStorage.removeItem(LS.voterKey);
+      pendingVoterPasswordAfterRegister = null;
+      resetVoterOtpUi();
+      updateNav();
+      showView("login");
+    };
+    if (r.status === 401 && voterAuthSent) {
+      clearVoterClientState();
+    }
+    if (r.status === 403 && voterAuthSent) {
+      const allowlist403 =
+        msgStr.includes("college authorized database") ||
+        msgStr.includes("approved college roster") ||
+        msgStr.includes("authorized college roster") ||
+        msgStr.includes("not authorized for this SecureVote deployment") ||
+        msgStr.includes("authorized student list");
+      if (allowlist403) {
+        clearVoterClientState();
+      }
+    }
+    throw new Error(msgStr);
   }
   return data;
 }
@@ -124,6 +156,8 @@ function updateNav() {
       localStorage.removeItem(LS.adminUser);
       localStorage.removeItem(LS.voterId);
       localStorage.removeItem(LS.voterKey);
+      pendingVoterPasswordAfterRegister = null;
+      resetVoterOtpUi();
       updateNav();
       showView("login");
       toast("Signed out");
@@ -165,8 +199,13 @@ $$(".tab").forEach((t) => {
   });
 });
 
-$("#link-register").onclick = () => showView("register");
+$("#link-register").onclick = () => {
+  resetVoterOtpUi();
+  showView("register");
+};
 $("#link-back-login").onclick = () => {
+  pendingVoterPasswordAfterRegister = null;
+  resetVoterOtpUi();
   showView("login");
   refreshAdminSetupUi();
 };
@@ -177,8 +216,26 @@ $("#link-admin-setup-back")?.addEventListener("click", () => {
   refreshAdminSetupUi();
 });
 
+let voterOtpPending = false;
+/** Cleared after voter JWT login succeeds or on sign-out / leaving register. */
+let pendingVoterPasswordAfterRegister = null;
+
+function resetVoterOtpUi() {
+  voterOtpPending = false;
+  $("#otp-field-wrap")?.classList.add("hidden");
+  $("#otp-hint")?.classList.add("hidden");
+  const otpInput = $("#form-voter-login")?.querySelector("input[name=otp]");
+  if (otpInput) {
+    otpInput.value = "";
+    otpInput.disabled = true;
+  }
+}
+
 $("#form-admin-first")?.addEventListener("submit", async (e) => {
   e.preventDefault();
+  if ($("#view-admin-setup")?.classList.contains("hidden")) {
+    return;
+  }
   const fd = new FormData(e.target);
   try {
     await api("/api/admin/register-first", {
@@ -223,9 +280,16 @@ function updateVoterKeyBanner(scrollTo = false) {
 
 $("#form-voter-login").onsubmit = async (e) => {
   e.preventDefault();
+  if ($("#view-login")?.classList.contains("hidden")) {
+    return;
+  }
   const fd = new FormData(e.target);
-  const vid = String(fd.get("voter_id") || "").trim();
+  const vid = String(fd.get("voter_id") || "").trim().toLowerCase();
   const password = fd.get("password");
+  /* Hidden inputs still submit: ignore OTP unless the OTP row is visible (step 2). */
+  const otpWrap = $("#otp-field-wrap");
+  const otpStepActive = otpWrap && !otpWrap.classList.contains("hidden");
+  const otp = otpStepActive ? String(fd.get("otp") || "").trim() : "";
   try {
     const prevId = String(localStorage.getItem(LS.voterId) || "").trim();
     if (prevId !== vid) {
@@ -233,11 +297,31 @@ $("#form-voter-login").onsubmit = async (e) => {
     }
     const data = await api("/api/login", {
       method: "POST",
-      json: { voter_id: vid, password },
+      json: { voter_id: vid, password, ...(otp ? { otp } : {}) },
       auth: "none",
     });
+    if (responseRequestedOtp(data)) {
+      voterOtpPending = true;
+      const otpIn = $("#form-voter-login")?.querySelector("input[name=otp]");
+      if (otpIn) otpIn.disabled = false;
+      $("#otp-field-wrap")?.classList.remove("hidden");
+      const hint = $("#otp-hint");
+      if (hint) {
+        hint.classList.remove("hidden");
+        hint.textContent = data.dev_otp
+          ? `OTP sent (demo mode): ${data.dev_otp}. Enter it below, then click Sign in.`
+          : "Enter the 6-digit OTP from your email, then click Sign in.";
+      }
+      toast(data.message || "Enter the one-time code below, then click Sign in.");
+      return;
+    }
+    if (!data.access_token) {
+      toast("Unexpected sign-in response. Try again.", true);
+      return;
+    }
     localStorage.setItem(LS.voterTok, data.access_token);
     localStorage.setItem(LS.voterId, vid);
+    pendingVoterPasswordAfterRegister = null;
     let restoreErr = null;
     if (!localStorage.getItem(LS.voterKey)) {
       try {
@@ -254,6 +338,7 @@ $("#form-voter-login").onsubmit = async (e) => {
     } else {
       toast("Welcome back");
     }
+    resetVoterOtpUi();
   } catch (err) {
     toast(err.message, true);
   }
@@ -274,6 +359,9 @@ $("#form-restore-key")?.addEventListener("submit", async (e) => {
 
 $("#form-admin-login").onsubmit = async (e) => {
   e.preventDefault();
+  if ($("#view-login")?.classList.contains("hidden")) {
+    return;
+  }
   const fd = new FormData(e.target);
   const username = String(fd.get("username") || "").trim();
   try {
@@ -295,28 +383,98 @@ $("#form-admin-login").onsubmit = async (e) => {
 
 $("#form-register").onsubmit = async (e) => {
   e.preventDefault();
+  if ($("#view-register")?.classList.contains("hidden")) {
+    return;
+  }
   const fd = new FormData(e.target);
+  const voterId = String(fd.get("voter_id") || "").trim().toLowerCase();
+  const password = fd.get("password");
   try {
+    /* Allowlist is enforced on POST /api/register only (no separate precheck call — avoids 404 if server is older). */
     const data = await api("/api/register", {
       method: "POST",
-      json: { voter_id: fd.get("voter_id"), password: fd.get("password") },
+      json: { voter_id: voterId, password },
       auth: "none",
     });
     localStorage.setItem(LS.voterKey, data.voter_private_key_pem);
     localStorage.setItem(LS.voterId, String(data.voter_id || "").trim());
-    toast("Account created — signing in…");
-    const login = await api("/api/login", {
+    pendingVoterPasswordAfterRegister = String(password);
+    toast("Account created. A one-time code was sent — enter it on the next step.");
+    const step1 = await api("/api/login", {
       method: "POST",
-      json: { voter_id: fd.get("voter_id"), password: fd.get("password") },
+      json: { voter_id: voterId, password },
       auth: "none",
     });
-    localStorage.setItem(LS.voterTok, login.access_token);
-    updateNav();
-    showView("voter");
-    loadVoterDashboard();
-    toast("Store this device safely — your signing key is only here.");
+    if (responseRequestedOtp(step1)) {
+      voterOtpPending = true;
+      resetVoterOtpUi();
+      $$(".tab").forEach((x) => x.classList.toggle("active", x.dataset.tab === "voter"));
+      $$(".form-panel").forEach((p) => p.classList.remove("active"));
+      $("#form-voter-login")?.classList.add("active");
+      showView("login");
+      const form = $("#form-voter-login");
+      if (form) {
+        const vi = form.querySelector("input[name=voter_id]");
+        const pw = form.querySelector("input[name=password]");
+        const ot = form.querySelector("input[name=otp]");
+        if (vi) vi.value = voterId;
+        if (pw) pw.value = pendingVoterPasswordAfterRegister || "";
+        if (ot) {
+          ot.value = "";
+          ot.disabled = false;
+        }
+      }
+      $("#otp-field-wrap")?.classList.remove("hidden");
+      const hint = $("#otp-hint");
+      if (hint) {
+        hint.classList.remove("hidden");
+        hint.textContent = step1.dev_otp
+          ? `OTP sent (demo mode): ${step1.dev_otp}. Type it in the box below, then click Sign in.`
+          : "Enter the 6-digit OTP from your email, then click Sign in.";
+      }
+      toast(step1.message || "Step 2: enter the one-time code, then click Sign in.");
+      return;
+    }
+    pendingVoterPasswordAfterRegister = null;
+    $$(".tab").forEach((x) => x.classList.toggle("active", x.dataset.tab === "voter"));
+    $$(".form-panel").forEach((p) => p.classList.remove("active"));
+    $("#form-voter-login")?.classList.add("active");
+    showView("login");
+    const form2 = $("#form-voter-login");
+    if (form2) {
+      const vi2 = form2.querySelector("input[name=voter_id]");
+      if (vi2) vi2.value = voterId;
+    }
+    toast(
+      "Account was created but the one-time code step did not complete. Use Sign in with the same email and password — you will receive a new code (email or, in demo mode, server log).",
+      true,
+    );
   } catch (err) {
-    toast(err.message, true);
+    pendingVoterPasswordAfterRegister = null;
+    const msg = String(err.message || "");
+    if (msg.includes("already registered") || msg.includes("Voter already exists")) {
+      resetVoterOtpUi();
+      $$(".tab").forEach((x) => x.classList.toggle("active", x.dataset.tab === "voter"));
+      $$(".form-panel").forEach((p) => p.classList.remove("active"));
+      $("#form-voter-login")?.classList.add("active");
+      showView("login");
+      const form = $("#form-voter-login");
+      if (form) {
+        const vi = form.querySelector("input[name=voter_id]");
+        const pw = form.querySelector("input[name=password]");
+        if (vi) vi.value = voterId;
+        if (pw) {
+          pw.value = "";
+          pw.focus();
+        }
+      }
+      toast(
+        "This email already has an account in the database (e.g. from a past sign-up or test). Use Sign in, enter the same email and the password you set, then click Sign in again for the one-time code.",
+        false,
+      );
+      return;
+    }
+    toast(msg, true);
   }
 };
 
@@ -886,22 +1044,27 @@ async function loadManage() {
   }
 }
 
-/* boot */
-function boot() {
+/* boot — verify voter JWT with server so localStorage cannot fake a session */
+(async function boot() {
   bindAdminStatsNav();
   updateNav();
   const vt = localStorage.getItem(LS.voterTok);
   const at = localStorage.getItem(LS.adminTok);
   if (vt) {
-    showView("voter");
-    loadVoterDashboard();
+    try {
+      await api("/api/voter/session", { auth: "voter" });
+      showView("voter");
+      await loadVoterDashboard();
+    } catch (e) {
+      toast(e.message, true);
+      showView("login");
+      refreshAdminSetupUi();
+    }
   } else if (at) {
     showView("admin");
-    loadAdminDashboard();
+    await loadAdminDashboard();
   } else {
     showView("login");
     refreshAdminSetupUi();
   }
-}
-
-boot();
+})();

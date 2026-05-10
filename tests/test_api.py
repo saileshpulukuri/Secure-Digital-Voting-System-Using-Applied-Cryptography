@@ -3,14 +3,25 @@
 from tests.helpers import build_ballot_contestant, create_test_election, iso_timestamp
 
 
+def voter_login_token(client, voter_id: str, password: str) -> str:
+    step1 = client.post("/api/login", json={"voter_id": voter_id, "password": password})
+    assert step1.status_code == 200
+    body = step1.json()
+    assert body.get("otp_required") is True
+    otp = body.get("dev_otp")
+    assert otp
+    step2 = client.post("/api/login", json={"voter_id": voter_id, "password": password, "otp": otp})
+    assert step2.status_code == 200
+    return step2.json()["access_token"]
+
+
 def test_register_login_vote_results_flow(client):
-    r = client.post("/api/register", json={"voter_id": "v1", "password": "password12"})
+    voter_id = "v1@umsystem.edu"
+    r = client.post("/api/register", json={"voter_id": voter_id, "password": "password12"})
     assert r.status_code == 201
     priv = r.json()["voter_private_key_pem"]
 
-    r = client.post("/api/login", json={"voter_id": "v1", "password": "password12"})
-    assert r.status_code == 200
-    token = r.json()["access_token"]
+    token = voter_login_token(client, voter_id, "password12")
 
     admin = client.post(
         "/api/admin/login", json={"username": "admin", "password": "test-admin-password"}
@@ -37,7 +48,7 @@ def test_register_login_vote_results_flow(client):
     r = client.post(
         f"/api/elections/{eid}/vote",
         headers={"Authorization": f"Bearer {token}"},
-        json={"voter_id": "v1", "encrypted_vote": enc, "signature": sig, "timestamp": ts},
+        json={"voter_id": voter_id, "encrypted_vote": enc, "signature": sig, "timestamp": ts},
     )
     assert r.status_code == 200
 
@@ -55,15 +66,82 @@ def test_register_login_vote_results_flow(client):
 
 
 def test_double_registration_conflict(client):
-    client.post("/api/register", json={"voter_id": "dup", "password": "password12"})
-    r = client.post("/api/register", json={"voter_id": "dup", "password": "password12"})
+    client.post("/api/register", json={"voter_id": "dup@umsystem.edu", "password": "password12"})
+    r = client.post("/api/register", json={"voter_id": "dup@umsystem.edu", "password": "password12"})
     assert r.status_code == 409
 
 
+def test_admin_delete_voter_then_register_again(client):
+    assert (
+        client.post("/api/register", json={"voter_id": "deleting@umsystem.edu", "password": "firstpass12"}).status_code
+        == 201
+    )
+    adm = client.post(
+        "/api/admin/login", json={"username": "admin", "password": "test-admin-password"}
+    ).json()["access_token"]
+    r = client.post(
+        "/api/admin/voters/delete",
+        headers={"Authorization": f"Bearer {adm}"},
+        json={"voter_id": "deleting@umsystem.edu"},
+    )
+    assert r.status_code == 200
+    r2 = client.post("/api/register", json={"voter_id": "deleting@umsystem.edu", "password": "secondpass12"})
+    assert r2.status_code == 201
+
+
+def test_reject_non_allowlisted_email(client):
+    r = client.post("/api/register", json={"voter_id": "other@umsystem.edu", "password": "password12"})
+    assert r.status_code == 403
+
+
+def test_register_precheck_rejects_unknown_email(client):
+    r = client.post("/api/register/precheck", json={"voter_id": "ertyu8i@umsystem.edu"})
+    assert r.status_code == 403
+    assert "authorized" in r.json().get("detail", "").lower()
+
+
+def test_register_precheck_ok_for_allowlisted_email(client):
+    r = client.post("/api/register/precheck", json={"voter_id": "v1@umsystem.edu"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body.get("ok") is True
+    assert body.get("voter_id") == "v1@umsystem.edu"
+
+
+def test_voter_jwt_rejected_when_sub_not_on_allowlist(client):
+    from src.auth_tokens import create_access_token
+
+    bad_tok = create_access_token("intruder@umsystem.edu", "voter")
+    r = client.get("/api/elections", headers={"Authorization": f"Bearer {bad_tok}"})
+    assert r.status_code == 403
+    assert "authorized" in r.json().get("detail", "").lower()
+
+
+def test_elections_no_auth_still_returns_list(client):
+    assert client.get("/api/elections").status_code == 200
+
+
+def test_elections_garbage_bearer_returns_401(client):
+    r = client.get("/api/elections", headers={"Authorization": "Bearer not-a-valid-jwt"})
+    assert r.status_code == 401
+
+
+def test_voter_session_returns_sub(client):
+    assert (
+        client.post("/api/register", json={"voter_id": "v1@umsystem.edu", "password": "password12"}).status_code
+        == 201
+    )
+    tok = voter_login_token(client, "v1@umsystem.edu", "password12")
+    r = client.get("/api/voter/session", headers={"Authorization": f"Bearer {tok}"})
+    assert r.status_code == 200
+    assert r.json()["voter_id"] == "v1@umsystem.edu"
+
+
 def test_double_vote_blocked(client):
-    reg = client.post("/api/register", json={"voter_id": "twice", "password": "password12"}).json()
+    voter_id = "twice@umsystem.edu"
+    reg = client.post("/api/register", json={"voter_id": voter_id, "password": "password12"}).json()
     priv = reg["voter_private_key_pem"]
-    tok = client.post("/api/login", json={"voter_id": "twice", "password": "password12"}).json()["access_token"]
+    tok = voter_login_token(client, voter_id, "password12")
     adm = client.post(
         "/api/admin/login", json={"username": "admin", "password": "test-admin-password"}
     ).json()["access_token"]
@@ -77,17 +155,18 @@ def test_double_vote_blocked(client):
     pub = d["public_key_pem"]
     h = {"Authorization": f"Bearer {tok}"}
     enc, sig, ts = build_ballot_contestant(1, pub, priv)
-    body = {"voter_id": "twice", "encrypted_vote": enc, "signature": sig, "timestamp": ts}
+    body = {"voter_id": voter_id, "encrypted_vote": enc, "signature": sig, "timestamp": ts}
     assert client.post(f"/api/elections/{eid}/vote", headers=h, json=body).status_code == 200
     enc2, sig2, ts2 = build_ballot_contestant(2, pub, priv)
-    body2 = {"voter_id": "twice", "encrypted_vote": enc2, "signature": sig2, "timestamp": ts2}
+    body2 = {"voter_id": voter_id, "encrypted_vote": enc2, "signature": sig2, "timestamp": ts2}
     assert client.post(f"/api/elections/{eid}/vote", headers=h, json=body2).status_code == 403
 
 
 def test_invalid_signature_rejected(client):
-    reg = client.post("/api/register", json={"voter_id": "sig", "password": "password12"}).json()
+    voter_id = "sig@umsystem.edu"
+    reg = client.post("/api/register", json={"voter_id": voter_id, "password": "password12"}).json()
     priv = reg["voter_private_key_pem"]
-    tok = client.post("/api/login", json={"voter_id": "sig", "password": "password12"}).json()["access_token"]
+    tok = voter_login_token(client, voter_id, "password12")
     adm = client.post(
         "/api/admin/login", json={"username": "admin", "password": "test-admin-password"}
     ).json()["access_token"]
@@ -102,7 +181,7 @@ def test_invalid_signature_rejected(client):
     r = client.post(
         f"/api/elections/{eid}/vote",
         headers={"Authorization": f"Bearer {tok}"},
-        json={"voter_id": "sig", "encrypted_vote": enc, "signature": "YmFk", "timestamp": ts},
+        json={"voter_id": voter_id, "encrypted_vote": enc, "signature": "YmFk", "timestamp": ts},
     )
     assert r.status_code == 409
 
@@ -125,7 +204,7 @@ def test_vote_requires_auth(client):
 
 
 def test_publish_forbidden_before_close(client):
-    client.post("/api/register", json={"voter_id": "t1", "password": "password12"})
+    client.post("/api/register", json={"voter_id": "t1@umsystem.edu", "password": "password12"})
     admin = client.post(
         "/api/admin/login", json={"username": "admin", "password": "test-admin-password"}
     ).json()["access_token"]
@@ -153,10 +232,9 @@ def test_admin_register_first_forbidden_after_seed(client):
 
 
 def test_restore_signing_key_ok_before_any_vote(client):
-    client.post("/api/register", json={"voter_id": "rekey1", "password": "password12"})
-    tok = client.post("/api/login", json={"voter_id": "rekey1", "password": "password12"}).json()[
-        "access_token"
-    ]
+    voter_id = "rekey1@umsystem.edu"
+    client.post("/api/register", json={"voter_id": voter_id, "password": "password12"})
+    tok = voter_login_token(client, voter_id, "password12")
     h = {"Authorization": f"Bearer {tok}"}
     r = client.post("/api/voter/restore-signing-key", headers=h, json={"password": "password12"})
     assert r.status_code == 200
@@ -164,10 +242,9 @@ def test_restore_signing_key_ok_before_any_vote(client):
 
 
 def test_restore_signing_key_wrong_password(client):
-    client.post("/api/register", json={"voter_id": "rekey2", "password": "password12"})
-    tok = client.post("/api/login", json={"voter_id": "rekey2", "password": "password12"}).json()[
-        "access_token"
-    ]
+    voter_id = "rekey2@umsystem.edu"
+    client.post("/api/register", json={"voter_id": voter_id, "password": "password12"})
+    tok = voter_login_token(client, voter_id, "password12")
     r = client.post(
         "/api/voter/restore-signing-key",
         headers={"Authorization": f"Bearer {tok}"},
@@ -178,11 +255,10 @@ def test_restore_signing_key_wrong_password(client):
 
 def test_restore_signing_key_after_vote_allows_second_election_and_tally(client):
     """Ballots store voter public key at cast time; rotating keys does not break older tallies."""
-    reg = client.post("/api/register", json={"voter_id": "rekey3", "password": "password12"}).json()
+    voter_id = "rekey3@umsystem.edu"
+    reg = client.post("/api/register", json={"voter_id": voter_id, "password": "password12"}).json()
     priv1 = reg["voter_private_key_pem"]
-    tok = client.post("/api/login", json={"voter_id": "rekey3", "password": "password12"}).json()[
-        "access_token"
-    ]
+    tok = voter_login_token(client, voter_id, "password12")
     h = {"Authorization": f"Bearer {tok}"}
     adm = client.post(
         "/api/admin/login", json={"username": "admin", "password": "test-admin-password"}
@@ -200,7 +276,7 @@ def test_restore_signing_key_after_vote_allows_second_election_and_tally(client)
         client.post(
             f"/api/elections/{e1}/vote",
             headers=h,
-            json={"voter_id": "rekey3", "encrypted_vote": enc1, "signature": sig1, "timestamp": ts1},
+            json={"voter_id": voter_id, "encrypted_vote": enc1, "signature": sig1, "timestamp": ts1},
         ).status_code
         == 200
     )
@@ -221,7 +297,7 @@ def test_restore_signing_key_after_vote_allows_second_election_and_tally(client)
         client.post(
             f"/api/elections/{e2}/vote",
             headers=h,
-            json={"voter_id": "rekey3", "encrypted_vote": enc2, "signature": sig2, "timestamp": ts2},
+            json={"voter_id": voter_id, "encrypted_vote": enc2, "signature": sig2, "timestamp": ts2},
         ).status_code
         == 200
     )

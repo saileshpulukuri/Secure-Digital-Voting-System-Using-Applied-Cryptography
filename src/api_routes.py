@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import re
+import secrets
+import smtplib
 import uuid
 from datetime import datetime, timezone
+from email.message import EmailMessage
 from pathlib import Path
 from typing import Annotated
 
@@ -40,6 +44,12 @@ _ALLOWED_CT = {"image/jpeg", "image/png", "image/webp"}
 _MAX_UPLOAD = 2 * 1024 * 1024
 
 
+class RegisterPrecheckBody(BaseModel):
+    """Email-only check: same allowlist as register, but does not create an account or require a password."""
+
+    voter_id: str = Field(min_length=1, max_length=128)
+
+
 class RegisterBody(BaseModel):
     voter_id: str = Field(min_length=1, max_length=128)
     password: str = Field(min_length=8)
@@ -48,6 +58,7 @@ class RegisterBody(BaseModel):
 class LoginBody(BaseModel):
     voter_id: str
     password: str
+    otp: str | None = None
 
 
 class AdminLoginBody(BaseModel):
@@ -58,6 +69,10 @@ class AdminLoginBody(BaseModel):
 class AdminRegisterBody(BaseModel):
     username: str = Field(min_length=3, max_length=64)
     password: str = Field(min_length=8)
+
+
+class AdminDeleteVoterBody(BaseModel):
+    voter_id: str = Field(min_length=1, max_length=128)
 
 
 class VoteBody(BaseModel):
@@ -71,6 +86,70 @@ class VoterPasswordBody(BaseModel):
     password: str = Field(min_length=1)
 
 
+def _normalize_voter_email(voter_id: str) -> str:
+    return voter_id.strip().lower()
+
+
+# Shown on register/login when email is not in STUDENT_EMAIL_ALLOWLIST, and when JWT sub is not allowlisted.
+ALLOWLIST_REJECTION_DETAIL = (
+    "This email is not in the college authorized database for SecureVote. Only the approved addresses on the server list may register."
+)
+
+
+def _validate_allowed_student_email(voter_id: str) -> str:
+    email = _normalize_voter_email(voter_id)
+    if not re.match(r"^[a-z0-9._%+-]+@umsystem\.edu$", email):
+        raise HTTPException(status_code=400, detail="Use your college email ending with @umsystem.edu")
+    if email not in settings.allowed_student_emails():
+        raise HTTPException(status_code=403, detail=ALLOWLIST_REJECTION_DETAIL)
+    return email
+
+
+def _assert_jwt_voter_sub_allowlisted(raw_sub: str) -> str:
+    """Re-check allowlist on every voter-authenticated request (JWT sub must match configured list)."""
+    email = _normalize_voter_email(raw_sub)
+    if email not in settings.allowed_student_emails():
+        raise HTTPException(status_code=403, detail=ALLOWLIST_REJECTION_DETAIL)
+    return email
+
+
+def _otp_hash(v: str) -> str:
+    return hashlib.sha256(v.encode("utf-8")).hexdigest()
+
+
+def _send_login_otp_email(recipient: str, code: str, expires_s: int) -> None:
+    mode = (settings.otp_delivery_mode or "demo").strip().lower()
+    if mode != "smtp":
+        logger.info("OTP for %s is %s (demo mode)", recipient, code)
+        return
+
+    host = settings.smtp_host.strip()
+    user = settings.smtp_username.strip()
+    pwd = settings.smtp_password
+    from_email = settings.smtp_from_email.strip() or user
+    if not host or not user or not pwd or not from_email:
+        raise HTTPException(status_code=500, detail="OTP email service is not configured on server")
+
+    msg = EmailMessage()
+    msg["Subject"] = "SecureVote login OTP"
+    msg["From"] = from_email
+    msg["To"] = recipient
+    msg.set_content(
+        "Your SecureVote OTP is: "
+        f"{code}\n\nThis code expires in {expires_s} seconds."
+        "\n\nIf you did not request this, ignore this email."
+    )
+    try:
+        with smtplib.SMTP(host, int(settings.smtp_port), timeout=20) as server:
+            if settings.smtp_use_starttls:
+                server.starttls()
+            server.login(user, pwd)
+            server.send_message(msg)
+    except Exception as exc:
+        logger.exception("Failed to send OTP email to %s", recipient)
+        raise HTTPException(status_code=502, detail=f"Failed to send OTP email: {exc}") from exc
+
+
 def bearer_token(authorization: str | None = Header(default=None)) -> str:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing bearer token")
@@ -81,7 +160,7 @@ def require_voter(token: str = Depends(bearer_token)) -> str:
     payload = safe_decode(token)
     if not payload or payload.get("role") != "voter" or not payload.get("sub"):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired session")
-    return str(payload["sub"])
+    return _assert_jwt_voter_sub_allowlisted(str(payload["sub"]))
 
 
 def admin_bearer(token: str = Depends(bearer_token)) -> None:
@@ -94,18 +173,35 @@ def optional_voter(authorization: str | None = Header(default=None)) -> str | No
     if not authorization or not authorization.lower().startswith("bearer "):
         return None
     tok = authorization.split(" ", 1)[1].strip()
+    if not tok:
+        return None
     p = safe_decode(tok)
-    if p and p.get("role") == "voter" and p.get("sub"):
-        return str(p["sub"])
+    if p is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired session")
+    if p.get("role") == "voter" and p.get("sub"):
+        return _assert_jwt_voter_sub_allowlisted(str(p["sub"]))
     return None
+
+
+@router.get("/voter/session")
+def voter_session(voter_sub: str = Depends(require_voter)):
+    """Lightweight check used on app load so the UI does not trust localStorage alone."""
+    return {"voter_id": voter_sub}
 
 
 # --- Models via dict / inline ---
 
 
+@router.post("/register/precheck")
+def api_register_precheck(body: RegisterPrecheckBody):
+    """Fail fast on the sign-up page: reject emails that are not in ``STUDENT_EMAIL_ALLOWLIST`` before any account exists."""
+    voter_id = _validate_allowed_student_email(body.voter_id)
+    return {"ok": True, "voter_id": voter_id}
+
+
 @router.post("/register", status_code=201)
 def api_register(body: RegisterBody):
-    voter_id = body.voter_id.strip()
+    voter_id = _validate_allowed_student_email(body.voter_id)
     password = body.password
     if not voter_id:
         raise HTTPException(status_code=400, detail="Invalid input format")
@@ -119,7 +215,10 @@ def api_register(body: RegisterBody):
             )
             conn.commit()
         except sqlite3.IntegrityError:
-            raise HTTPException(status_code=409, detail="Voter already exists")
+            raise HTTPException(
+                status_code=409,
+                detail="This email is already registered. Use Sign in (not Register) with the same address and password — a one-time code will be sent next.",
+            )
         audit_log(conn, "voter_registered", voter_id)
     return {
         "voter_id": voter_id,
@@ -130,14 +229,64 @@ def api_register(body: RegisterBody):
 
 @router.post("/login")
 def api_login(body: LoginBody):
-    voter_id = body.voter_id
+    voter_id = _validate_allowed_student_email(body.voter_id)
     password = body.password
+    otp = (body.otp or "").strip()
     with get_connection(_db_path) as conn:
         row = conn.execute("SELECT * FROM voters WHERE voter_id = ?", (voter_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Voter not found")
         if not verify_password(password, row["password_hash"]):
-            raise HTTPException(status_code=401, detail="Authentication failed")
+            raise HTTPException(
+                status_code=401,
+                detail="Incorrect password for this account. The one-time code is only sent after your password is accepted. Use the same password you chose at registration.",
+            )
+        if not otp:
+            code = f"{secrets.randbelow(1_000_000):06d}"
+            expires = datetime.now(timezone.utc).timestamp() + int(settings.otp_expire_seconds)
+            expires_at = datetime.fromtimestamp(expires, timezone.utc).isoformat().replace("+00:00", "Z")
+            _send_login_otp_email(voter_id, code, int(settings.otp_expire_seconds))
+            conn.execute(
+                "UPDATE voter_login_otps SET consumed = 1 WHERE voter_id = ? AND consumed = 0",
+                (voter_id,),
+            )
+            conn.execute(
+                """INSERT INTO voter_login_otps (voter_id, otp_hash, expires_at, consumed, created_at)
+                   VALUES (?, ?, ?, 0, ?)""",
+                (voter_id, _otp_hash(code), expires_at, _utc_iso()),
+            )
+            conn.commit()
+            payload = {
+                "otp_required": True,
+                "message": "OTP sent to your college email. Enter it to finish sign in.",
+                "expires_in_seconds": int(settings.otp_expire_seconds),
+            }
+            if settings.expose_otp_in_response and (settings.otp_delivery_mode or "demo").lower() != "smtp":
+                payload["dev_otp"] = code
+            audit_log(conn, "voter_login_otp_issued", voter_id)
+            return payload
+
+        rec = conn.execute(
+            """SELECT * FROM voter_login_otps
+               WHERE voter_id = ? AND consumed = 0
+               ORDER BY id DESC LIMIT 1""",
+            (voter_id,),
+        ).fetchone()
+        if not rec:
+            raise HTTPException(status_code=401, detail="No active OTP. Request a new OTP.")
+        try:
+            if parse_iso8601(rec["expires_at"]) < datetime.now(timezone.utc):
+                conn.execute("UPDATE voter_login_otps SET consumed = 1 WHERE id = ?", (rec["id"],))
+                conn.commit()
+                raise HTTPException(status_code=401, detail="OTP expired. Request a new OTP.")
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid OTP state")
+        if _otp_hash(otp) != rec["otp_hash"]:
+            raise HTTPException(status_code=401, detail="Invalid OTP")
+        conn.execute("UPDATE voter_login_otps SET consumed = 1 WHERE id = ?", (rec["id"],))
+        conn.commit()
         audit_log(conn, "voter_login", voter_id)
     return {"access_token": create_access_token(voter_id, "voter"), "token_type": "bearer"}
 
@@ -219,6 +368,19 @@ def api_admin_login(body: AdminLoginBody):
             raise HTTPException(status_code=401, detail="Invalid username or password")
         audit_log(conn, "admin_login", row["username"])
     return {"access_token": create_access_token(row["username"], "admin"), "token_type": "bearer"}
+
+
+@router.post("/admin/voters/delete")
+def admin_delete_voter(body: AdminDeleteVoterBody, _: None = Depends(admin_bearer)):
+    """Support / dev: remove a voter so they can register again with a new password. Cascades OTPs and related rows."""
+    vid = _normalize_voter_email(body.voter_id)
+    with get_connection(_db_path) as conn:
+        cur = conn.execute("DELETE FROM voters WHERE voter_id = ?", (vid,))
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Voter not found")
+        conn.commit()
+        audit_log(conn, "admin_voter_deleted", vid)
+    return {"ok": True, "voter_id": vid}
 
 
 @router.get("/admin/dashboard-summary")

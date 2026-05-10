@@ -48,7 +48,7 @@ uvicorn src.main:app --reload --host 127.0.0.1 --port 8000
 
 Open **http://127.0.0.1:8000/** in a browser.
 
-- **Voter tab**: sign in or create an account (signing key saved in this browser).
+- **Voter tab**: sign in or create an account using an authorized `@umsystem.edu` email. Login is password + OTP.
 - **Admin tab**: password is `ADMIN_PASSWORD` from `.env` (hashed once into the DB on first run).
 - **Admin**: *Create election* (class / department / campus), add contestant names + photos, set open/close times. *Approvals* for registration requests. *Manage* to **Close** an election, then **Publish results** so voters see counts in **Results**.
 
@@ -59,6 +59,11 @@ Open **http://127.0.0.1:8000/** in a browser.
 | `JWT_SECRET` | HMAC key for JWTs |
 | `ADMIN_PASSWORD` | Used to seed the first admin account if the `admins` table is empty (bcrypt in DB) |
 | `ADMIN_USERNAME` | Username for that seeded account (default `admin`) |
+| `STUDENT_EMAIL_ALLOWLIST` | Comma-separated authorized student emails (e.g. `ts8md@umsystem.edu,spc7p@umsystem.edu`) |
+| `OTP_EXPIRE_SECONDS` | OTP lifetime in seconds (default `300`) |
+| `OTP_DELIVERY_MODE` | `demo` (logs/returns OTP) or `smtp` (sends real OTP email) |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL`, `SMTP_USE_STARTTLS` | SMTP settings used when `OTP_DELIVERY_MODE=smtp` |
+| `EXPOSE_OTP_IN_RESPONSE` | Demo/testing helper to include OTP in API response (`true` by default; set `false` in production) |
 | `DATABASE_PATH` | Optional SQLite path (default `./data/voting.db`) |
 | `DATA_DIR` | Optional data root for DB default path + `uploads/` |
 
@@ -84,6 +89,24 @@ Legacy shims for the original single-election flow: `/api/legacy/...`.
 ```bash
 pytest
 ```
+
+## Real OTP email setup
+
+1. Set these in `.env`:
+
+```env
+OTP_DELIVERY_MODE=smtp
+SMTP_HOST=smtp.office365.com
+SMTP_PORT=587
+SMTP_USERNAME=<your-mail@umsystem.edu>
+SMTP_PASSWORD=<smtp/app-password>
+SMTP_FROM_EMAIL=<your-mail@umsystem.edu>
+SMTP_USE_STARTTLS=true
+EXPOSE_OTP_IN_RESPONSE=false
+```
+
+2. Restart the server.
+3. Login sends OTP to the student email in `STUDENT_EMAIL_ALLOWLIST`.
 
 ## License
 
